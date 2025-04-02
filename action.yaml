@@ -107,7 +107,7 @@ runs:
   using: "composite"
   steps:
     - name: checkout repo
-      uses: actions/checkout@v4
+      uses: actions/checkout@ee0669bd1cc54295c223e0bb666b733df41de1c5
       if: inputs.checkout == 'true'
       with:
         fetch-depth: 0 # Fetch all history
