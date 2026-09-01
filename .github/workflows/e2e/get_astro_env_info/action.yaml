@@ -42,33 +42,82 @@ runs:
     - name: Get info from inputs or secrets
       shell: bash
       id: get-info
+      env:
+        INPUT_WORKSPACE_ID: ${{ inputs.input_workspace_id }}
+        SECRET_WORKSPACE_ID: ${{ inputs.secret_workspace_id }}
+        INPUT_ORGANIZATION_ID: ${{ inputs.input_organization_id }}
+        SECRET_ORGANIZATION_ID: ${{ inputs.secret_organization_id }}
+        INPUT_ASTRO_API_TOKEN: ${{ inputs.input_astro_api_token }}
+        SECRET_ASTRO_API_TOKEN: ${{ inputs.secret_astro_api_token }}
+        INPUT_ASTRONOMER_HOST: ${{ inputs.input_astronomer_host }}
+        SECRET_ASTRONOMER_HOST: ${{ inputs.secret_astronomer_host }}
       run: |
-        if [ "${{ inputs.input_workspace_id }}" != "" ]; then
+        set -euo pipefail
+
+        write_output() {
+          local name="$1"
+          local value="$2"
+          local delimiter="ghadelim_$(cat /proc/sys/kernel/random/uuid)"
+          {
+            printf '%s<<%s\n' "$name" "$delimiter"
+            printf '%s\n' "$value"
+            printf '%s\n' "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+        }
+
+        write_environment() {
+          local name="$1"
+          local value="$2"
+          local delimiter="ghadelim_$(cat /proc/sys/kernel/random/uuid)"
+          {
+            printf '%s<<%s\n' "$name" "$delimiter"
+            printf '%s\n' "$value"
+            printf '%s\n' "$delimiter"
+          } >> "$GITHUB_ENV"
+        }
+
+        if [[ -n "$INPUT_WORKSPACE_ID" ]]; then
           echo "Using provided workspace_id"
-          echo "WORKSPACE_ID=${{ inputs.input_workspace_id }}" >> $GITHUB_OUTPUT
+          workspace_id="$INPUT_WORKSPACE_ID"
         else
-          echo "WORKSPACE_ID=${{ inputs.secret_workspace_id }}" >> $GITHUB_OUTPUT
+          workspace_id="$SECRET_WORKSPACE_ID"
         fi
+        write_output "WORKSPACE_ID" "$workspace_id"
 
-        if [ "${{ inputs.input_organization_id }}" != "" ]; then
+        if [[ -n "$INPUT_ORGANIZATION_ID" ]]; then
           echo "Using provided org_id"
-          echo "ORGANIZATION_ID=${{ inputs.input_organization_id }}" >> $GITHUB_OUTPUT
+          organization_id="$INPUT_ORGANIZATION_ID"
         else
-          echo "ORGANIZATION_ID=${{ inputs.secret_organization_id }}" >> $GITHUB_OUTPUT
+          organization_id="$SECRET_ORGANIZATION_ID"
         fi
+        write_output "ORGANIZATION_ID" "$organization_id"
 
-        if [ "${{ inputs.input_astronomer_host }}" != "" ]; then
+        if [[ -n "$INPUT_ASTRONOMER_HOST" ]]; then
           echo "Using provided astronomer_host"
-          echo "ASTRONOMER_HOST=${{ inputs.input_astronomer_host }}" >> $GITHUB_OUTPUT
+          astronomer_host="$INPUT_ASTRONOMER_HOST"
         else
-          echo "ASTRONOMER_HOST=${{ inputs.secret_astronomer_host }}" >> $GITHUB_OUTPUT
+          astronomer_host="$SECRET_ASTRONOMER_HOST"
+        fi
+        write_output "ASTRONOMER_HOST" "$astronomer_host"
+
+        if [[ -n "$INPUT_ASTRO_API_TOKEN" ]]; then
+          echo "Using provided token"
+          astro_api_token="$INPUT_ASTRO_API_TOKEN"
+        else
+          astro_api_token="$SECRET_ASTRO_API_TOKEN"
+        fi
+        if [[ ! "$workspace_id" =~ ^[A-Za-z0-9._-]+$ || ! "$organization_id" =~ ^[A-Za-z0-9._-]+$ ]]; then
+          echo "Invalid workspace or organization ID format"
+          exit 1
+        fi
+        if [[ ! "$astronomer_host" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]]; then
+          echo "Invalid Astronomer host format"
+          exit 1
+        fi
+        if [[ -z "$astro_api_token" ]]; then
+          echo "Astro API token is required"
+          exit 1
         fi
 
-        if [ "${{ inputs.input_astro_api_token }}" != "" ]; then
-          echo "Using provided token"
-          echo "ASTRO_API_TOKEN=${{ inputs.input_astro_api_token }}" >> $GITHUB_OUTPUT
-          echo "ASTRO_API_TOKEN=${{ inputs.input_astro_api_token }}" >> $GITHUB_ENV
-        else
-          echo "ASTRO_API_TOKEN=${{ inputs.secret_astro_api_token }}" >> $GITHUB_OUTPUT
-          echo "ASTRO_API_TOKEN=${{ inputs.secret_astro_api_token }}" >> $GITHUB_ENV
-        fi
+        write_output "ASTRO_API_TOKEN" "$astro_api_token"
+        write_environment "ASTRO_API_TOKEN" "$astro_api_token"

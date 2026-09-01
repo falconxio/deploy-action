@@ -120,10 +120,14 @@ runs:
       run: |
         echo "The 'deploy-image' option is deprecated and will be removed in 1.0 release. Use 'deploy-type: image-and-dags' instead."
     - name: Install Astro CLI
+      env:
+        INPUT_CLI_VERSION: ${{ inputs.cli-version }}
+        DEPLOY_TYPE: ${{ inputs.deploy-type }}
       run: |
+        set -euo pipefail
 
         echo ::group::Install Astro CLI
-        CLI_VERSION=${{ inputs.cli-version }}
+        CLI_VERSION="$INPUT_CLI_VERSION"
         # if Astro CLI is pre-installed, fetch it's version
         if command -v astro &> /dev/null; then
           # "astro version" commands returns the CLI version, its output is of the form: "Astro CLI Version: 1.29.0"
@@ -131,7 +135,7 @@ runs:
         fi
 
         # Check if the Astro CLI version is less than 1.28.1 for dbt-deploy
-        if [[ "${{ inputs.deploy-type }}" == "dbt" && $CLI_VERSION != "" ]]; then
+        if [[ "$DEPLOY_TYPE" == "dbt" && -n "$CLI_VERSION" ]]; then
           #install semver to compare versions
           npm install -g semver
 
@@ -151,71 +155,101 @@ runs:
 
         # check if CLI_VERSION does not starts with "v", then add "v" to it
         if [[ $CLI_VERSION != "" && $CLI_VERSION != v* ]]; then
-          CLI_VERSION=v$CLI_VERSION
+          CLI_VERSION="v$CLI_VERSION"
         fi
 
         if [[ $CLI_VERSION == "" ]]; then
           curl -sSL https://install.astronomer.io | sudo bash -s
         else
-          curl -sSL https://install.astronomer.io | sudo bash -s -- $CLI_VERSION
+          curl -sSL https://install.astronomer.io | sudo bash -s -- "$CLI_VERSION"
         fi
         echo ::endgroup::
       shell: bash
     - name: Determine Deploy Deployment
+      env:
+        ACTION_NAME: ${{ inputs.action }}
+        WORKSPACE_ID: ${{ inputs.workspace }}
+        INPUT_DEPLOYMENT_NAME: ${{ inputs.deployment-name }}
+        INPUT_DEPLOYMENT_ID: ${{ inputs.deployment-id }}
+        PREVIEW_NAME: ${{ inputs.preview-name }}
+        EVENT_REF: ${{ github.event.ref }}
       run: |
+        set -euo pipefail
+
+        write_output() {
+          local name="$1"
+          local value="$2"
+          local delimiter="ghadelim_$(cat /proc/sys/kernel/random/uuid)"
+          {
+            printf '%s<<%s\n' "$name" "$delimiter"
+            printf '%s\n' "$value"
+            printf '%s\n' "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+        }
+
+        validate_preview_name() {
+          if [[ ! "$1" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid deployment preview name"
+            exit 1
+          fi
+        }
 
         echo ::group::Determine Deploy Deployment
 
         # validate action input
-        if [[ ${{ inputs.action }} != create-deployment-preview && ${{ inputs.action }} != delete-deployment-preview && ${{ inputs.action }} != deploy-deployment-preview && ${{ inputs.action }} != deploy ]]; then
+        if [[ "$ACTION_NAME" != "create-deployment-preview" && "$ACTION_NAME" != "delete-deployment-preview" && "$ACTION_NAME" != "deploy-deployment-preview" && "$ACTION_NAME" != "deploy" ]]; then
           echo ERROR: you specified an improper action input. Action must be deploy, deploy-deployment-preview, create-deployment-preview, or delete-deployment-preview.
           exit 1 # terminate and indicate error
         fi
 
         # Select workspace if specified
-        if [[ "${{ inputs.workspace }}" != "" ]]; then
-          astro workspace switch ${{ inputs.workspace }}
+        if [[ -n "$WORKSPACE_ID" ]]; then
+          astro workspace switch "$WORKSPACE_ID"
         fi
         # error if both deployment name and id are used
-        if [[ "${{ inputs.deployment-name }}" != "" && "${{ inputs.deployment-id }}" != "" ]]; then
+        if [[ -n "$INPUT_DEPLOYMENT_NAME" && -n "$INPUT_DEPLOYMENT_ID" ]]; then
           echo ERROR: cannot specify both a Deployment ID and Name
           exit 1 # terminate and indicate error
         fi
         # figure out deployment id
-        if [[ "${{ inputs.deployment-name }}" != "" ]]; then
-          # get deployment-id
-          DEPLOYMENT_ID="$(astro deployment inspect --clean-output -n "${{ inputs.deployment-name }}" --key metadata.deployment_id)"
+        if [[ -n "$INPUT_DEPLOYMENT_NAME" ]]; then
+          DEPLOYMENT_ID="$(astro deployment inspect --clean-output -n "$INPUT_DEPLOYMENT_NAME" --key metadata.deployment_id)"
         fi
 
-        if [[ "${{ inputs.deployment-id }}" != "" ]]; then
-          DEPLOYMENT_ID="${{ inputs.deployment-id }}"
+        if [[ -n "$INPUT_DEPLOYMENT_ID" ]]; then
+          DEPLOYMENT_ID="$INPUT_DEPLOYMENT_ID"
+        fi
+        if [[ -z "${DEPLOYMENT_ID:-}" || ! "$DEPLOYMENT_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+          echo "Invalid or missing deployment ID"
+          exit 1
         fi
         # create deployment preview if action is create-deployment-preview
-        if [[ ${{ inputs.action }} == create-deployment-preview ]]; then
+        if [[ "$ACTION_NAME" == "create-deployment-preview" ]]; then
 
-          if [[ "${{ inputs.deployment-name }}" == "" && "${{ inputs.deployment-id }}" == "" ]]; then
+          if [[ -z "$INPUT_DEPLOYMENT_NAME" && -z "$INPUT_DEPLOYMENT_ID" ]]; then
             echo ERROR: cannot create a deployment preview without specifying a deployment name or id
             exit 1 # terminate and indicate error
           fi
 
-          if [[ "${{ inputs.preview-name }}" != "" ]]; then
-            BRANCH_DEPLOYMENT_NAME="${{ inputs.preview-name }}"
+          if [[ -n "$PREVIEW_NAME" ]]; then
+            BRANCH_DEPLOYMENT_NAME="$PREVIEW_NAME"
           else
             # get branch name
-            DEPLOYMENT_NAME="$(astro deployment inspect $DEPLOYMENT_ID --clean-output --key configuration.name)"
+            DEPLOYMENT_NAME="$(astro deployment inspect "$DEPLOYMENT_ID" --clean-output --key configuration.name)"
             if [[ ${GITHUB_HEAD_REF##*/} != "" ]]; then
               BRANCH_DEPLOYMENT_NAME=${GITHUB_HEAD_REF##*/}_$DEPLOYMENT_NAME
             else
-              branch_ref="${{ github.ref }}"
+              branch_ref="$GITHUB_REF"
               branch_name="${branch_ref##*/}"
               BRANCH_DEPLOYMENT_NAME=${branch_name}_$DEPLOYMENT_NAME
             fi
             BRANCH_DEPLOYMENT_NAME="${BRANCH_DEPLOYMENT_NAME// /_}"
-            echo $BRANCH_DEPLOYMENT_NAME
+            echo "$BRANCH_DEPLOYMENT_NAME"
           fi
+          validate_preview_name "$BRANCH_DEPLOYMENT_NAME"
 
           # Create template of deployment to be copied with
-          astro deployment inspect $DEPLOYMENT_ID --clean-output --template > deployment-preview-template.yaml # automatically creates deployment-preview-template.yaml file
+          astro deployment inspect "$DEPLOYMENT_ID" --clean-output --template > deployment-preview-template.yaml # automatically creates deployment-preview-template.yaml file
 
           # Add name to deployment template file
           sed -i "s|  name:.*|  name: ${BRANCH_DEPLOYMENT_NAME}|g"  deployment-preview-template.yaml
@@ -226,352 +260,382 @@ runs:
           # TODO: we need to add wait for deployment to be created, otherwise operation to copy airflow resources like connection is flaky if webserver is not up by then
 
           # Get final Deployment ID
-          echo "FINAL_DEPLOYMENT_ID=$(astro deployment inspect --clean-output -n $BRANCH_DEPLOYMENT_NAME --key metadata.deployment_id)" >> $GITHUB_OUTPUT
+          write_output "FINAL_DEPLOYMENT_ID" "$(astro deployment inspect --clean-output -n "$BRANCH_DEPLOYMENT_NAME" --key metadata.deployment_id)"
 
           # Get original Deployment ID
-          echo "ORIGINAL_DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+          write_output "ORIGINAL_DEPLOYMENT_ID" "$DEPLOYMENT_ID"
         fi
 
         # delete deployment preview and skip deploy if action is delete-deployment-preview
-        if [[ ${{ inputs.action }} == delete-deployment-preview ]]; then
+        if [[ "$ACTION_NAME" == "delete-deployment-preview" ]]; then
 
-          if [[ "${{ inputs.deployment-name }}" == "" && "${{ inputs.deployment-id }}" == "" ]]; then
+          if [[ -z "$INPUT_DEPLOYMENT_NAME" && -z "$INPUT_DEPLOYMENT_ID" ]]; then
             echo ERROR: cannot delete a deployment preview without specifying a deployment name or id
             exit 1 # terminate and indicate error
           fi
 
-          if [[ "${{ inputs.preview-name }}" != "" ]]; then
-            BRANCH_DEPLOYMENT_NAME="${{ inputs.preview-name }}"
+          if [[ -n "$PREVIEW_NAME" ]]; then
+            BRANCH_DEPLOYMENT_NAME="$PREVIEW_NAME"
           else
             # Get deployment name from Astro if preview-name is not provided
-            DEPLOYMENT_NAME="$(astro deployment inspect $DEPLOYMENT_ID --clean-output --key configuration.name)"
+            DEPLOYMENT_NAME="$(astro deployment inspect "$DEPLOYMENT_ID" --clean-output --key configuration.name)"
             # using github.event.ref to refer the actual branch getting deleted
-            branch_ref="${{ github.event.ref }}"
+            branch_ref="$EVENT_REF"
             branch_name="${branch_ref##*/}"
             BRANCH_DEPLOYMENT_NAME=${branch_name}_$DEPLOYMENT_NAME
             BRANCH_DEPLOYMENT_NAME="${BRANCH_DEPLOYMENT_NAME// /_}"
           fi
+          validate_preview_name "$BRANCH_DEPLOYMENT_NAME"
           # delete branch deployment
-          astro deployment delete -n $BRANCH_DEPLOYMENT_NAME -f
+          astro deployment delete -n "$BRANCH_DEPLOYMENT_NAME" -f
         fi
 
         # # deploy to deployment preview if action is deploy-deployment-preview
-        if [[ ${{ inputs.action }} == deploy-deployment-preview ]]; then
+        if [[ "$ACTION_NAME" == "deploy-deployment-preview" ]]; then
 
-          if [[ "${{ inputs.deployment-name }}" == "" && "${{ inputs.deployment-id }}" == "" ]]; then
+          if [[ -z "$INPUT_DEPLOYMENT_NAME" && -z "$INPUT_DEPLOYMENT_ID" ]]; then
             echo ERROR: cannot deploy to a deployment preview without specifying a deployment name or id
             exit 1 # terminate and indicate error
           fi
 
-          if [[ "${{ inputs.preview-name }}" != "" ]]; then
-            BRANCH_DEPLOYMENT_NAME="${{ inputs.preview-name }}"
+          if [[ -n "$PREVIEW_NAME" ]]; then
+            BRANCH_DEPLOYMENT_NAME="$PREVIEW_NAME"
           else
-            DEPLOYMENT_NAME="$(astro deployment inspect $DEPLOYMENT_ID --clean-output --key configuration.name)"
+            DEPLOYMENT_NAME="$(astro deployment inspect "$DEPLOYMENT_ID" --clean-output --key configuration.name)"
             if [[ ${GITHUB_HEAD_REF##*/} != "" ]]; then
               BRANCH_DEPLOYMENT_NAME=${GITHUB_HEAD_REF##*/}_$DEPLOYMENT_NAME
             else
               # BRANCH_DEPLOYMENT_NAME=${{ github.event.ref }}_$DEPLOYMENT_NAME
-              branch_ref="${{ github.ref }}"
+              branch_ref="$GITHUB_REF"
               branch_name="${branch_ref##*/}"
               BRANCH_DEPLOYMENT_NAME=${branch_name}_$DEPLOYMENT_NAME
             fi
             BRANCH_DEPLOYMENT_NAME="${BRANCH_DEPLOYMENT_NAME// /_}"
           fi
+          validate_preview_name "$BRANCH_DEPLOYMENT_NAME"
 
           # Get Deployment ID
-          echo "FINAL_DEPLOYMENT_ID=$(astro deployment inspect --clean-output -n $BRANCH_DEPLOYMENT_NAME --key metadata.deployment_id)" >> $GITHUB_OUTPUT
+          write_output "FINAL_DEPLOYMENT_ID" "$(astro deployment inspect --clean-output -n "$BRANCH_DEPLOYMENT_NAME" --key metadata.deployment_id)"
         fi
 
         # if action is deploy or dbt deploy simply set final Deployment id to Deployment id to streamline the deployment id reference in rest of the workflow
-        if [[ ${{ inputs.action }} == deploy ]]; then
-          echo "FINAL_DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+        if [[ "$ACTION_NAME" == "deploy" ]]; then
+          write_output "FINAL_DEPLOYMENT_ID" "$DEPLOYMENT_ID"
         fi
 
         echo ::endgroup::
       shell: bash
       id: deployment-preview
     - name: Determine if DAG Deploy is enabled
+      env:
+        ACTION_NAME: ${{ inputs.action }}
+        FINAL_DEPLOYMENT_ID: ${{ steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID }}
       run: |
+        set -euo pipefail
 
         echo ::group::Determine if DAG Deploy is enabled
-        if [[ ${{ inputs.action }} != create-deployment-preview && ${{ inputs.action }} != delete-deployment-preview ]]; then
-          echo "DAG_DEPLOY_ENABLED=$(astro deployment inspect ${{steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID}} --clean-output --key configuration.dag_deploy_enabled)" >> $GITHUB_OUTPUT
+        if [[ "$ACTION_NAME" != "create-deployment-preview" && "$ACTION_NAME" != "delete-deployment-preview" ]]; then
+          echo "DAG_DEPLOY_ENABLED=$(astro deployment inspect "$FINAL_DEPLOYMENT_ID" --clean-output --key configuration.dag_deploy_enabled)" >> "$GITHUB_OUTPUT"
         else
-          echo "DAG_DEPLOY_ENABLED=false" >> $GITHUB_OUTPUT
+          echo "DAG_DEPLOY_ENABLED=false" >> "$GITHUB_OUTPUT"
         fi
         echo ::endgroup::
       shell: bash
       id: dag-deploy-enabled
     - name: Get DBT Deploy Options
       if: ${{ inputs.deploy-type == 'dbt' }}
+      env:
+        ROOT_FOLDER: ${{ inputs.root-folder }}
+        MOUNT_PATH: ${{ inputs.mount-path }}
+        DESCRIPTION: ${{ inputs.description }}
+        EVENT_BEFORE: ${{ github.event.before }}
+        EVENT_AFTER: ${{ github.event.after }}
       run: |
+        set -euo pipefail
+
+        write_output() {
+          local name="$1"
+          local value="$2"
+          local delimiter="ghadelim_$(cat /proc/sys/kernel/random/uuid)"
+          {
+            printf '%s<<%s\n' "$name" "$delimiter"
+            printf '%s\n' "$value"
+            printf '%s\n' "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+        }
 
         echo ::group::Get DBT Deploy Options
 
-        if [[ "${{ inputs.root-folder }}" != "" ]]; then
-          cd ${{ inputs.root-folder }}
+        if [[ -n "$ROOT_FOLDER" ]]; then
+          cd -- "$ROOT_FOLDER"
         fi
 
-        branch=$(echo "${GITHUB_REF#refs/heads/}")
+        branch="${GITHUB_REF#refs/heads/}"
         echo "Branch pushed to: $branch"
-        git fetch origin $branch
+        git fetch origin -- "$branch"
 
         DBT_DEPLOY=false
-
-        # case when the triggered event is a manual workflow dispatch or a new branch or tag creation, we would need to deploy the dbt project because we cannot determine that it does not need to be deployed
-        GITHUB_EVENT_BEFORE=${{ github.event.before }}
-        GITHUB_EVENT_AFTER=${{ github.event.after }}
-        if [[ "$GITHUB_EVENT_BEFORE" == "0000000000000000000000000000000000000000" || -z $GITHUB_EVENT_BEFORE && -z $GITHUB_EVENT_AFTER ]]; then
+        if [[ "$EVENT_BEFORE" == "0000000000000000000000000000000000000000" || ( -z "$EVENT_BEFORE" && -z "$EVENT_AFTER" ) ]]; then
           DBT_DEPLOY=true
-          files=()
+          files=""
         else
-          files=$(git diff --name-only $GITHUB_EVENT_BEFORE $GITHUB_EVENT_AFTER)
-          echo "files changed: $files"
+          files="$(git diff --name-only "$EVENT_BEFORE" "$EVENT_AFTER")"
+          echo "Changed files were collected"
         fi
 
-        for file in $files; do
-          if [[ $file =~ ^"${{ inputs.root-folder }}".* ]]; then
-            echo $file is part of configured root folder, so would be triggering a dbt deploy
+        while IFS= read -r file; do
+          [[ -z "$file" ]] && continue
+          if [[ -z "$ROOT_FOLDER" || "$ROOT_FOLDER" == "." || "$file" == "$ROOT_FOLDER"* ]]; then
+            echo "A changed file is part of the configured root folder"
             DBT_DEPLOY=true
           fi
-        done
+        done <<< "$files"
 
-        options=""
-        if [[ $DBT_DEPLOY == true ]]; then
-          # Add mount path option
-          if [[ "${{ inputs.mount-path }}" != "" ]]; then
-            options="$options --mount-path=${{ inputs.mount-path }}"
-          fi
-
-          # Add description option
-          if [[ "${{ inputs.description }}" != "" ]]; then
-            options="$options --description '${{ inputs.description }}'"
-          fi
+        write_output "DBT_DEPLOY" "$DBT_DEPLOY"
+        if [[ "$DBT_DEPLOY" == true ]]; then
+          write_output "DBT_MOUNT_PATH" "$MOUNT_PATH"
+          write_output "DBT_DESCRIPTION" "$DESCRIPTION"
+        else
+          write_output "DBT_MOUNT_PATH" ""
+          write_output "DBT_DESCRIPTION" ""
         fi
-
-        echo "DBT_DEPLOY=$DBT_DEPLOY" >> $GITHUB_OUTPUT
-        echo "DBT_OPTIONS=$options" >> $GITHUB_OUTPUT
         echo ::endgroup::
       shell: bash
       id: dbt-deploy-options
     - name: Get Deploy Type
       if: ${{ inputs.deploy-type == 'infer' || inputs.deploy-type == 'dags-only' || inputs.deploy-type == 'image-and-dags' }}
+      env:
+        ROOT_FOLDER: ${{ inputs.root-folder }}
+        DEPLOY_TYPE: ${{ inputs.deploy-type }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        ACTION_NAME: ${{ inputs.action }}
+        DAG_DEPLOY_ENABLED: ${{ steps.dag-deploy-enabled.outputs.DAG_DEPLOY_ENABLED }}
+        EVENT_BEFORE: ${{ github.event.before }}
+        EVENT_AFTER: ${{ github.event.after }}
       run: |
+        set -euo pipefail
 
-        # infer based on files changed to deploy only dags or image and dags
         echo ::group::Get Deploy Type
-
-        if [[ "${{ inputs.root-folder }}" != "" ]]; then
-          cd ${{ inputs.root-folder }}
-        fi
-
         DAGS_ONLY_DEPLOY=false
         SKIP_IMAGE_OR_DAGS_DEPLOY=false
-        files=()
+        files=""
 
-        GITHUB_EVENT_BEFORE=${{ github.event.before }}
-        GITHUB_EVENT_AFTER=${{ github.event.after }}
-        # case when the triggered event is a manual workflow dispatch or a new branch or tag creation, we would need to deploy the image because we cannot determine that it does not need to be deployed
-        if [[ "$GITHUB_EVENT_BEFORE" == "0000000000000000000000000000000000000000" ||  -z $GITHUB_EVENT_BEFORE && -z $GITHUB_EVENT_AFTER ]]; then
-          echo "Manual workflow dispatch or a new branch or tag creation, hence missing github event before and/or after commit hash"
+        if [[ "$EVENT_BEFORE" == "0000000000000000000000000000000000000000" || ( -z "$EVENT_BEFORE" && -z "$EVENT_AFTER" ) ]]; then
+          echo "The triggering event does not provide a commit range; falling back to image deploy."
+        elif [[ "$EVENT_BEFORE" =~ ^[0-9a-fA-F]{40}$ && "$EVENT_AFTER" =~ ^[0-9a-fA-F]{40}$ ]] && git cat-file -e "$EVENT_BEFORE^{commit}" 2>/dev/null; then
+          SKIP_IMAGE_OR_DAGS_DEPLOY=true
+          files="$(git diff --name-only "$EVENT_BEFORE" "$EVENT_AFTER" --)"
+          echo "Changed files were collected"
         else
-          echo "event that triggered the workflow: $GITHUB_REF"
-          branch=$(echo "${GITHUB_REF#refs/heads/}")
-          git fetch origin $branch
-          if ! git cat-file -e "${{ github.event.before }}" 2>/dev/null; then
-            echo "Commit ${{ github.event.before }} does not exist, falling back to image deploy."
-          else
-            SKIP_IMAGE_OR_DAGS_DEPLOY=true
-            files=$(git diff --name-only ${{ github.event.before }} ${{ github.event.after }})
-            echo "files changed: $files"
-          fi
+          echo "The commit range is unavailable; falling back to image deploy."
         fi
 
-        for file in $files; do
-          if [[ $file =~ ^"${{ inputs.root-folder }}".* ]]; then
-            echo $file is part of the input root folder
-            SKIP_IMAGE_OR_DAGS_DEPLOY=false
-            if [[ ${{ inputs.deploy-type }} == 'infer' ]]; then
-              if [[ $file == *"dags/"* ]]; then
-                echo $file is part of dags folder
+        while IFS= read -r file; do
+          [[ -z "$file" ]] && continue
+          if [[ -n "$ROOT_FOLDER" && "$ROOT_FOLDER" != "." && "$file" != "$ROOT_FOLDER"/* ]]; then
+            continue
+          fi
+
+          SKIP_IMAGE_OR_DAGS_DEPLOY=false
+          relative_file="$file"
+          if [[ -n "$ROOT_FOLDER" && "$ROOT_FOLDER" != "." ]]; then
+            relative_file="${file#"$ROOT_FOLDER"/}"
+          fi
+
+          case "$DEPLOY_TYPE" in
+            infer)
+              if [[ "$relative_file" == dags/* || "$relative_file" == */dags/* ]]; then
                 DAGS_ONLY_DEPLOY=true
               else
                 DAGS_ONLY_DEPLOY=false
                 break
               fi
-            elif [[ ${{ inputs.deploy-type }} == 'dags-only' ]]; then
-              if [[ $file == *"dags/"* ]]; then
-                echo $file is part of dags folder
+              ;;
+            dags-only)
+              if [[ "$relative_file" == dags/* || "$relative_file" == */dags/* ]]; then
                 DAGS_ONLY_DEPLOY=true
               fi
-            elif [[ ${{ inputs.deploy-type }} == 'image-and-dags' ]]; then
+              ;;
+            image-and-dags)
               DAGS_ONLY_DEPLOY=false
               break
-            fi
-          fi
-        done
+              ;;
+          esac
+        done <<< "$files"
 
-        # Note: the order of these following checks is important to ensure that we skip/trigger deploy correctly in following cases:
-        # 1. When there is no change in the input root folder we should skip deploy, but not when it's deployment preview create action
-        # 2. When user has passed a custom image then we would need to deploy the image
-        # 3. When the action is deployment preview delete, then we should skip any form of deploy
-        if [[ $SKIP_IMAGE_OR_DAGS_DEPLOY == true ]]; then
-          # skip all deploy steps
+        if [[ "$SKIP_IMAGE_OR_DAGS_DEPLOY" == true ]]; then
           DAGS_ONLY_DEPLOY=false
         fi
 
-        # check if user has passed a custom image or the action has created a new deployment preview, then we would need to deploy the image
-        if [[ ${{ inputs.image-name }} != "no-custom-image" || ${{ steps.dag-deploy-enabled.outputs.DAG_DEPLOY_ENABLED }} == false || ${{ inputs.action }} == create-deployment-preview ]]; then
+        if [[ "$IMAGE_NAME" != "no-custom-image" || "$DAG_DEPLOY_ENABLED" == false || "$ACTION_NAME" == "create-deployment-preview" ]]; then
           SKIP_IMAGE_OR_DAGS_DEPLOY=false
           DAGS_ONLY_DEPLOY=false
         fi
 
-        if [[ ${{ inputs.action }} == delete-deployment-preview ]]; then
-          # skip all deploy steps
+        if [[ "$ACTION_NAME" == "delete-deployment-preview" ]]; then
           SKIP_IMAGE_OR_DAGS_DEPLOY=true
           DAGS_ONLY_DEPLOY=false
         fi
 
-        echo "DAGS_ONLY_DEPLOY=$DAGS_ONLY_DEPLOY" >> $GITHUB_OUTPUT
-        echo "SKIP_IMAGE_OR_DAGS_DEPLOY=$SKIP_IMAGE_OR_DAGS_DEPLOY" >> $GITHUB_OUTPUT
+        echo "DAGS_ONLY_DEPLOY=$DAGS_ONLY_DEPLOY" >> "$GITHUB_OUTPUT"
+        echo "SKIP_IMAGE_OR_DAGS_DEPLOY=$SKIP_IMAGE_OR_DAGS_DEPLOY" >> "$GITHUB_OUTPUT"
         echo ::endgroup::
       shell: bash
       id: deploy-type
-    # If only DAGs changed and dag deploys is enabled, do a DAG-only deploy
-    - name: Setup image or dags deploy options
-      if: ${{ inputs.deploy-type == 'infer' || inputs.deploy-type == 'dags-only' || inputs.deploy-type == 'image-and-dags' }}
-      run: |
 
-        echo ::group::Setup image or dags deploy options
-        options=""
-
-        # add parse option
-        if [[ ${{ inputs.parse }} == true ]]; then
-          options="--parse"
-        fi
-
-        # add pytest option
-        if [[ ${{ inputs.pytest }} == true ]]; then
-          options="$options --pytest --test ${{ inputs.pytest-file }}"
-        fi
-
-        # add custom image option
-        if [[ ${{ inputs.image-name }} != no-custom-image && inputs.deploy-type != "dags-only" ]]; then
-          options="$options --image-name ${{ inputs.image-name }}"
-        fi
-
-        # add force option
-        if [[ ${{ inputs.force }} == true ]]; then
-          options="$options --force"
-        fi
-
-        # Add description option
-        if [[ "${{ inputs.description }}" != '' ]]; then
-          options="$options --description '${{ inputs.description }}'"
-        fi
-
-        # Add build-secrets option
-        if [[ "${{ inputs.build-secrets }}" != '' ]]; then
-          options="$options --build-secrets '${{ inputs.build-secrets }}'"
-        fi
-
-        echo "OPTIONS=$options" >> $GITHUB_OUTPUT
-        echo ::endgroup::
-      shell: bash
-      id: deploy-options
     - name: Determine if Development Mode is enabled
       if: ${{ inputs.wake-on-deploy == 'true' && inputs.action != 'delete-deployment-preview' }}
+      env:
+        FINAL_DEPLOYMENT_ID: ${{ steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID }}
       run: |
+        set -euo pipefail
+
         echo ::group::Determine if Development Mode is enabled
-        DEPLOYMENT_TYPE=$(astro deployment inspect ${{steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID}} --clean-output --key configuration.deployment_type)
-        # only inspect development mode if deployment is not hybrid
-        if [[ $DEPLOYMENT_TYPE != "HYBRID" ]]; then
-          DEV_MODE=$(astro deployment inspect ${{steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID}} --clean-output --key configuration.is_development_mode)
-          echo "Deployment development mode: $DEV_MODE"
-          if [[ $DEV_MODE == "" ]]; then
-            echo "DEVELOPMENT_MODE=false" >> $GITHUB_OUTPUT
-          else
-            echo "DEVELOPMENT_MODE=$DEV_MODE" >> $GITHUB_OUTPUT
-          fi
+        deployment_type="$(astro deployment inspect "$FINAL_DEPLOYMENT_ID" --clean-output --key configuration.deployment_type)"
+        if [[ "$deployment_type" != "HYBRID" ]]; then
+          development_mode="$(astro deployment inspect "$FINAL_DEPLOYMENT_ID" --clean-output --key configuration.is_development_mode)"
+          echo "Deployment development mode: $development_mode"
+          echo "DEVELOPMENT_MODE=${development_mode:-false}" >> "$GITHUB_OUTPUT"
         else
-          echo "DEVELOPMENT_MODE=false" >> $GITHUB_OUTPUT
+          echo "DEVELOPMENT_MODE=false" >> "$GITHUB_OUTPUT"
         fi
         echo ::endgroup::
       shell: bash
       id: development-mode
     - name: Override to wake up the Deployment
       if: ${{ inputs.wake-on-deploy == 'true' && inputs.action != 'delete-deployment-preview' && steps.development-mode.outputs.DEVELOPMENT_MODE == 'true' }}
+      env:
+        FINAL_DEPLOYMENT_ID: ${{ steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID }}
       run: |
+        set -euo pipefail
+
         echo ::group::Override to wake up the Deployment
-        astro deployment wake-up ${{steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID}} --force
-        # Wait for the deployment to wake up
-        while [ "$(astro deployment inspect ${{steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID}} --clean-output --key metadata.status)" == "HIBERNATING" ]
-        do
+        astro deployment wake-up "$FINAL_DEPLOYMENT_ID" --force
+        while [[ "$(astro deployment inspect "$FINAL_DEPLOYMENT_ID" --clean-output --key metadata.status)" == "HIBERNATING" ]]; do
           sleep 5
         done
         echo ::endgroup::
       shell: bash
     - name: DAG Deploy to Astro
       if: ${{ (inputs.deploy-type == 'dags-only' || inputs.deploy-type == 'infer') && steps.deploy-type.outputs.DAGS_ONLY_DEPLOY == 'true' }}
+      env:
+        ROOT_FOLDER: ${{ inputs.root-folder }}
+        FINAL_DEPLOYMENT_ID: ${{ steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID }}
+        PARSE: ${{ inputs.parse }}
+        PYTEST: ${{ inputs.pytest }}
+        PYTEST_FILE: ${{ inputs.pytest-file }}
+        FORCE: ${{ inputs.force }}
+        DESCRIPTION: ${{ inputs.description }}
+        BUILD_SECRETS: ${{ inputs.build-secrets }}
       run: |
+        set -euo pipefail
 
         echo ::group::DAG Deploy to Astro
-        # Deploy only dags
-
-        if [[ "${{ inputs.root-folder }}" != "" ]]; then
-          cd ${{ inputs.root-folder }}
+        if [[ -n "$ROOT_FOLDER" ]]; then
+          cd -- "$ROOT_FOLDER"
         fi
 
-        astro deploy ${{steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID}} --dags ${{steps.deploy-options.outputs.OPTIONS}}
+        deploy_args=()
+        [[ "$PARSE" == true ]] && deploy_args+=(--parse)
+        if [[ "$PYTEST" == true ]]; then
+          deploy_args+=(--pytest --test "$PYTEST_FILE")
+        fi
+        [[ "$FORCE" == true ]] && deploy_args+=(--force)
+        [[ -n "$DESCRIPTION" ]] && deploy_args+=(--description "$DESCRIPTION")
+        [[ -n "$BUILD_SECRETS" ]] && deploy_args+=(--build-secrets "$BUILD_SECRETS")
+
+        astro deploy "$FINAL_DEPLOYMENT_ID" --dags "${deploy_args[@]}"
         echo ::endgroup::
       shell: bash
     # If any other files changed or dag deploys is disabled, deploy the entire Astro project
     - name: Image and DAG Deploy to Astro
       if: ${{ inputs.deploy-image == true || ( (inputs.deploy-type == 'image-and-dags' || inputs.deploy-type == 'infer') && steps.deploy-type.outputs.DAGS_ONLY_DEPLOY == 'false' && steps.deploy-type.outputs.SKIP_IMAGE_OR_DAGS_DEPLOY == 'false' ) }}
+      env:
+        ROOT_FOLDER: ${{ inputs.root-folder }}
+        FINAL_DEPLOYMENT_ID: ${{ steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID }}
+        DEPLOY_TYPE: ${{ inputs.deploy-type }}
+        IMAGE_NAME: ${{ inputs.image-name }}
+        PARSE: ${{ inputs.parse }}
+        PYTEST: ${{ inputs.pytest }}
+        PYTEST_FILE: ${{ inputs.pytest-file }}
+        FORCE: ${{ inputs.force }}
+        DESCRIPTION: ${{ inputs.description }}
+        BUILD_SECRETS: ${{ inputs.build-secrets }}
       run: |
-        echo ::group::Image and DAG Deploy to Astro
-        # Deploy image and DAGs
+        set -euo pipefail
 
-        if [[ "${{ inputs.root-folder }}" != "" ]]; then
-          cd ${{ inputs.root-folder }}
+        echo ::group::Image and DAG Deploy to Astro
+        if [[ -n "$ROOT_FOLDER" ]]; then
+          cd -- "$ROOT_FOLDER"
         fi
 
-        astro deploy ${{steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID}} ${{steps.deploy-options.outputs.OPTIONS}}
+        deploy_args=()
+        [[ "$PARSE" == true ]] && deploy_args+=(--parse)
+        if [[ "$PYTEST" == true ]]; then
+          deploy_args+=(--pytest --test "$PYTEST_FILE")
+        fi
+        if [[ "$IMAGE_NAME" != "no-custom-image" && "$DEPLOY_TYPE" != "dags-only" ]]; then
+          deploy_args+=(--image-name "$IMAGE_NAME")
+        fi
+        [[ "$FORCE" == true ]] && deploy_args+=(--force)
+        [[ -n "$DESCRIPTION" ]] && deploy_args+=(--description "$DESCRIPTION")
+        [[ -n "$BUILD_SECRETS" ]] && deploy_args+=(--build-secrets "$BUILD_SECRETS")
+
+        astro deploy "$FINAL_DEPLOYMENT_ID" "${deploy_args[@]}"
         echo ::endgroup::
       shell: bash
     - name: DBT Deploy to Astro
       if: ${{ inputs.deploy-type == 'dbt' && steps.dbt-deploy-options.outputs.DBT_DEPLOY == 'true' }}
+      env:
+        ROOT_FOLDER: ${{ inputs.root-folder }}
+        FINAL_DEPLOYMENT_ID: ${{ steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID }}
+        MOUNT_PATH: ${{ steps.dbt-deploy-options.outputs.DBT_MOUNT_PATH }}
+        DESCRIPTION: ${{ steps.dbt-deploy-options.outputs.DBT_DESCRIPTION }}
       run: |
+        set -euo pipefail
 
         echo ::group::DBT Deploy to Astro
-
-        if [[ "${{ inputs.root-folder }}" != "" ]]; then
-          cd ${{ inputs.root-folder }}
+        if [[ -n "$ROOT_FOLDER" ]]; then
+          cd -- "$ROOT_FOLDER"
         fi
 
-        astro dbt deploy ${{steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID}} ${{steps.dbt-deploy-options.outputs.DBT_OPTIONS}}
+        deploy_args=()
+        [[ -n "$MOUNT_PATH" ]] && deploy_args+=(--mount-path "$MOUNT_PATH")
+        [[ -n "$DESCRIPTION" ]] && deploy_args+=(--description "$DESCRIPTION")
+        astro dbt deploy "$FINAL_DEPLOYMENT_ID" "${deploy_args[@]}"
         echo ::endgroup::
       shell: bash
     - name: Copy Airflow Connections, Variables, and Pools
       if: ${{ inputs.action == 'create-deployment-preview' }}
+      env:
+        COPY_CONNECTIONS: ${{ inputs.copy-connections }}
+        COPY_AIRFLOW_VARIABLES: ${{ inputs.copy-airflow-variables }}
+        COPY_POOLS: ${{ inputs.copy-pools }}
+        ORIGINAL_DEPLOYMENT_ID: ${{ steps.deployment-preview.outputs.ORIGINAL_DEPLOYMENT_ID }}
+        FINAL_DEPLOYMENT_ID: ${{ steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID }}
       run: |
+        set -euo pipefail
 
         echo ::group::Copy Airflow Connections, Variables, and Pools
-        if [[ ${{ inputs.copy-connections }} == true ]]; then
-          astro deployment connection copy --source-id ${{steps.deployment-preview.outputs.ORIGINAL_DEPLOYMENT_ID}}  --target-id ${{steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID}}
+        if [[ "$COPY_CONNECTIONS" == true ]]; then
+          astro deployment connection copy --source-id "$ORIGINAL_DEPLOYMENT_ID" --target-id "$FINAL_DEPLOYMENT_ID"
         fi
-        if [[ ${{ inputs.copy-airflow-variables }} == true ]]; then
-          astro deployment airflow-variable copy --source-id ${{steps.deployment-preview.outputs.ORIGINAL_DEPLOYMENT_ID}} --target-id ${{steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID}}
+        if [[ "$COPY_AIRFLOW_VARIABLES" == true ]]; then
+          astro deployment airflow-variable copy --source-id "$ORIGINAL_DEPLOYMENT_ID" --target-id "$FINAL_DEPLOYMENT_ID"
         fi
-        if [[ ${{ inputs.copy-pools }} == true ]]; then
-          astro deployment pool copy --source-id ${{steps.deployment-preview.outputs.ORIGINAL_DEPLOYMENT_ID}} --target-id ${{steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID}}
+        if [[ "$COPY_POOLS" == true ]]; then
+          astro deployment pool copy --source-id "$ORIGINAL_DEPLOYMENT_ID" --target-id "$FINAL_DEPLOYMENT_ID"
         fi
         echo ::endgroup::
       shell: bash
     - name: Remove override on Deployment to resume schedule
       if: ${{ inputs.wake-on-deploy == 'true' && inputs.action != 'delete-deployment-preview' && steps.development-mode.outputs.DEVELOPMENT_MODE == 'true' }}
+      env:
+        FINAL_DEPLOYMENT_ID: ${{ steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID }}
       run: |
+        set -euo pipefail
+
         echo ::group::Remove override on Deployment to resume schedule
-        astro deployment wake-up ${{steps.deployment-preview.outputs.FINAL_DEPLOYMENT_ID}} --remove-override --force
+        astro deployment wake-up "$FINAL_DEPLOYMENT_ID" --remove-override --force
         echo ::endgroup::
       shell: bash

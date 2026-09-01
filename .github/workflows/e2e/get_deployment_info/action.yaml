@@ -34,15 +34,57 @@ runs:
     - name: Get Deployment Info
       id: get-deployment-info
       shell: bash
+      env:
+        DEPLOYMENT_ID: ${{ inputs.deployment_id }}
+        ORGANIZATION_ID: ${{ inputs.organization_id }}
+        ASTRO_API_TOKEN: ${{ inputs.astro_api_token }}
+        ASTRONOMER_HOST: ${{ inputs.astronomer_host }}
+        EXPECTED_STATUS_CODE: ${{ inputs.expected_status_code }}
       run: |
-        STATUS_CODE=$(curl -s -w "%{http_code}" -o response.json -H "Authorization: Bearer ${{ inputs.astro_api_token }}" "https://api.${{ inputs.astronomer_host }}/v1alpha1/organizations/${{ inputs.organization_id }}/deployments/${{ inputs.deployment_id }}")
-        if [[ $STATUS_CODE -ne ${{ inputs.expected_status_code }} ]]; then
-          echo "Failed to get expected status code from GET Deployment API. Status code: $STATUS_CODE"
+        set -euo pipefail
+
+        if [[ ! "$ASTRONOMER_HOST" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9]$ ]]; then
+          echo "Invalid Astronomer host format"
           exit 1
         fi
-        desired_dag_tarball_version=$(cat response.json | jq -r '.desiredDagTarballVersion')
-        desired_image_version=$(cat response.json | jq -r '.desiredImageVersion')
-        hibernation_spec=$(cat response.json | jq -rc '.scalingSpec.hibernationSpec')
-        echo "desired_dag_tarball_version=$desired_dag_tarball_version" >> $GITHUB_OUTPUT
-        echo "desired_image_version=$desired_image_version" >> $GITHUB_OUTPUT
-        echo "hibernation_spec=$hibernation_spec" >> $GITHUB_OUTPUT
+        if [[ ! "$ORGANIZATION_ID" =~ ^[A-Za-z0-9._-]+$ || ! "$DEPLOYMENT_ID" =~ ^[A-Za-z0-9._-]+$ ]]; then
+          echo "Invalid organization or deployment ID format"
+          exit 1
+        fi
+        if [[ ! "$EXPECTED_STATUS_CODE" =~ ^[0-9]{3}$ ]]; then
+          echo "Invalid expected status code"
+          exit 1
+        fi
+
+        write_output() {
+          local name="$1"
+          local value="$2"
+          local delimiter="ghadelim_$(cat /proc/sys/kernel/random/uuid)"
+          {
+            printf '%s<<%s\n' "$name" "$delimiter"
+            printf '%s\n' "$value"
+            printf '%s\n' "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+        }
+
+        rm -f response.json
+        status_code="$({
+          curl --silent --show-error --fail-with-body \
+            --write-out '%{http_code}' \
+            --output response.json \
+            --header "Authorization: Bearer $ASTRO_API_TOKEN" \
+            "https://api.$ASTRONOMER_HOST/v1alpha1/organizations/$ORGANIZATION_ID/deployments/$DEPLOYMENT_ID"
+        } || true)"
+
+        if [[ "$status_code" != "$EXPECTED_STATUS_CODE" ]]; then
+          echo "Failed to get expected status code from GET Deployment API. Status code: $status_code"
+          exit 1
+        fi
+
+        desired_dag_tarball_version=$(jq -er '.desiredDagTarballVersion' response.json)
+        desired_image_version=$(jq -er '.desiredImageVersion' response.json)
+        hibernation_spec=$(jq -ec '.scalingSpec.hibernationSpec' response.json)
+
+        write_output "desired_dag_tarball_version" "$desired_dag_tarball_version"
+        write_output "desired_image_version" "$desired_image_version"
+        write_output "hibernation_spec" "$hibernation_spec"
